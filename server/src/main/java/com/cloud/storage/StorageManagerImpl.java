@@ -4799,6 +4799,7 @@ public class StorageManagerImpl extends ManagerBase implements StorageManager, C
                 _objectStoreDao.update(id, objectStoreVO);
                 throw new IllegalArgumentException("Unable to access Object Storage with URL: " + cmd.getUrl());
             }
+            updateBucketUrls(id, oldUrl, url);
         }
 
         if(cmd.getName() != null ) {
@@ -4810,6 +4811,57 @@ public class StorageManagerImpl extends ManagerBase implements StorageManager, C
         _objectStoreDao.update(id, objectStoreVO);
         logger.debug("Successfully updated object store: {}", objectStoreVO);
         return objectStoreVO;
+    }
+
+    /**
+     * Object store detail key holding an explicit S3 endpoint override. Providers
+     * that support it (SeaweedFS, Cloudian HyperStore) prefer it over the generic
+     * ObjectStoreVO.url.
+     */
+    private static final String OBJECT_STORE_DETAIL_S3_URL = "s3Url";
+
+    /**
+     * Rewrite the stored bucketURL of every bucket on an object store after the
+     * generic store URL changes.
+     *
+     * BucketVO.bucketURL is written only at bucket creation. BucketResponse
+     * exposes it and the object-store browser builds its S3 client from it, so
+     * without this the browser keeps targeting the old endpoint after a URL
+     * change while the management server uses the new one.
+     *
+     * Skipped when the pool has an explicit s3Url detail: providers that support
+     * that override (SeaweedFS, Cloudian HyperStore) keep using it regardless of
+     * ObjectStoreVO.url, so rewriting the bucket URLs off the generic URL would
+     * point the browser at an endpoint the driver never uses.
+     */
+    private void updateBucketUrls(Long storeId, String oldUrl, String newUrl) {
+        if (oldUrl == null || newUrl == null || oldUrl.equals(newUrl)) {
+            return;
+        }
+        Map<String, String> storeDetails = _objectStoreDetailsDao.getDetails(storeId);
+        if (storeDetails != null && StringUtils.isNotBlank(storeDetails.get(OBJECT_STORE_DETAIL_S3_URL))) {
+            logger.debug("Object store {} has an explicit s3Url; leaving stored bucket URLs unchanged", storeId);
+            return;
+        }
+        // Both URLs are operator-supplied and may carry a trailing slash. Strip
+        // them so the retained suffix (which starts with '/') is not appended to
+        // a base that already ends in one, which would rewrite every bucket URL
+        // to '...//bucket' and break browser access.
+        String oldBase = StringUtils.stripEnd(oldUrl, "/");
+        String newBase = StringUtils.stripEnd(newUrl, "/");
+        if (oldBase.equals(newBase)) {
+            return;
+        }
+        for (BucketVO bucket : _bucketDao.listByObjectStoreId(storeId)) {
+            String bucketUrl = bucket.getBucketURL();
+            if (bucketUrl == null || !bucketUrl.startsWith(oldBase)) {
+                continue;
+            }
+            String suffix = bucketUrl.substring(oldBase.length());
+            bucket.setBucketURL(newBase + (suffix.startsWith("/") ? suffix : "/" + suffix));
+            _bucketDao.update(bucket.getId(), bucket);
+            logger.debug("Updated bucket {} URL to {} after object store URL change", bucket.getName(), bucket.getBucketURL());
+        }
     }
 
     @Override
